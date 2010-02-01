@@ -61,7 +61,14 @@ class Entity(object):
                 sqlalchemy.Column('updated', sqlalchemy.DATETIME(), default=datetime.datetime.now, onupdate=datetime.datetime.now),
                 sqlalchemy.Column('created', sqlalchemy.DATETIME(), default=datetime.datetime.now)
             )
+        self.result_records = []
 
+        #Memebers that hold data built up by successive
+        #generative calls
+        self.func_clauses = []
+        self.func_name = None
+        self.func_table = None
+        
     def new(self):
         return self.record_class()
 
@@ -122,44 +129,52 @@ class Entity(object):
             rec = self.record_class(id=r.id, value=self.codec.decode(r.body), created=r.created, updated=r.updated)
             records.append(rec)
         return records
-
+    
     @property 
     def c(self):
         return IndexClauseElement(self)
 
-    def select(self, *clauses):
-        """Run a select query
-        
-        Arguments
-        *clauses -- SQLAlchemy index clauses
-
-        Returns:
-        [records matching clauses]
-        """
+    def _sql_handler (self, *clauses):
         if not clauses:
-            return []
-
-        clauses = reduce(sqlalchemy.and_, clauses) if clauses else []
+            return self
+        
+        if self.func_name in map(lambda a:a[0],self.func_clauses):
+            raise Exception, "Generative function specified more than once"
 
         tables = []
         def check_unique_table(column):
             if tables and column.table not in tables:
                 raise NotImplementedError("Can't join indices yet")
             tables.append(column.table)
-        visitors.traverse(clauses, {}, {'column': functools.partial(check_unique_table)})
+        for clause in clauses:
+            visitors.traverse(clause, {}, {'column': functools.partial(check_unique_table)})
         assert tables
 
+        if not self.func_table:
+            self.func_table = tables[0]
+        else:
+            assert self.func_table == tables[0], "Can't join indices yet"
+        self.func_clauses.append ((self.func_name,clauses))
+        self.func_name = None
+        return self
+
+    def __getattr__ (self, name):
+        self.func_name = name
+        return self._sql_handler
+
+    def fetchall (self):
         index_vals = []
         for index in self.indices:
-            if index.table == tables[0]:
-                index_vals.extend(index.select(clauses))
+            if index.table == self.func_table:
+                index_vals.extend(index.query(self.func_clauses))
                 break
-        ids = set(i.id for i in index_vals)
+        ids = [i.id for i in index_vals]
+        self.func_clauses = []
         return self.lookup(ids)
 
 class Index(object):
     """A persistent database index for index values 
-
+  
     This is backed by a SQL Table with an compound index over all of the column values.
 
     Arguments:
@@ -179,15 +194,56 @@ class Index(object):
         self.index = sqlalchemy.Index(name + '_idx', *columns)
         self.mapper = mapper
         self.shard = shard
+        self.select_clause = None
 
-    def select(self, clause):
-        """Select values from a shard based on a clause"""
+    def _sort (self, results, order_rationale):
+        def sort_by_num (results, pos, order):
+            if order == 1:
+                def my_cmp (a,b):
+                    return cmp(a[pos], b[pos])
+            else:
+                def my_cmp (a,b):
+                    return cmp(b[pos], a[pos])
+            results.sort(my_cmp)
+        for pos, order in order_rationale:
+            sort_by_num (results, pos, order)
+        return results    
+
+    def query (self,func_clauses):
+        order_rationale = []
+        query = None
+        for func, clauses in func_clauses:
+            if func == 'select':
+                clause = reduce(sqlalchemy.and_, clauses) if clauses else []
+                query = sql.select([self.table], clause)
+                continue
+            if func == 'order_by':
+                for clause in clauses:
+                    if not query:
+                        query = sql.select([self.table])
+                    query = query.order_by(clause)
+                    #Inorder to sort the records from sharded db's
+                    #we need to save the position of the column to be sorted
+                    #and also the order (aescending/descending)
+                    if type(clause) == type(sqlalchemy.schema.Column()):
+                        position =  list(self.c).index(str(clause))
+                        order = 1
+                    else:
+                        #clause is of type  unary expression
+                        position = list(self.c).index(self.name+'.'+clause.element.key)
+                        order = clause.modifier.func_name == 'desc_op' and -1 or 1
+                    order_rationale.append((position, order))
+
         results = []
         for engine in self.shard.engines_for_clauses(clause):
             conn = engine.connect()
-            results_ = conn.execute(sql.select([self.table], clause))
+            results_ = conn.execute(query)
             results.extend(results_)
             conn.close()
+        if order_rationale:
+            print results
+            results = self._sort(results, order_rationale)
+            print results
         return results
 
     def create(self):
@@ -208,14 +264,14 @@ class Index(object):
             engine = self.shard.engine_for_record_mapping(record, mapping)
             engine_to_mapping[engine].append(mapping)
 
-        for e in self.shard.engines:
-            conn = engine.connect()
-            trx = conn.begin()
-            conn.execute(self.table.delete().where(self.table.c.id == record.id))
-            for mapping in engine_to_mapping[engine]:
-                conn.execute(self.table.insert().values(id=record.id, **mapping))
-            trx.commit()
-            conn.close()
+        #for e in self.shard.engines:
+        conn = engine.connect()
+        trx = conn.begin()
+        conn.execute(self.table.delete().where(self.table.c.id == record.id))
+        for mapping in engine_to_mapping[engine]:
+            conn.execute(self.table.insert().values(id=record.id, **mapping))
+        trx.commit()
+        conn.close()
 
 class Record(object):
     """The basic record/row datatype for an Entity
